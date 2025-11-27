@@ -7,6 +7,10 @@ from sqlalchemy.exc import IntegrityError
 from app.database import engine, SessionLocal
 from app.models import Base, ModuleDB
 from app.schemas import (ModuleCreate, ModuleRead, ModuleUpdate)
+import httpx
+import os
+
+POST_SERVICE_URL = os.getenv("POST_SERVICE_URL", "http://localhost:8000")
 
 #Replacing @app.on_event("startup")
 @asynccontextmanager
@@ -115,3 +119,9 @@ def delete_module(id_module: int, db: Session = Depends(get_db)) -> Response:
     db.delete(module)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@app.get("/api/proxy/posts")
+def proxy_posts():
+    with httpx.Client() as client:
+        response = client.get(f"{POST_SERVICE_URL}/api/get-all-posts")
+    return response.json()
