@@ -145,14 +145,20 @@ async def add_module(payload: ModuleCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="Module already exists")
     return module
 
+from typing import Optional
+
+# ... imports ...
+
 @app.get("/api/module", response_model=list[ModuleRead])
-def list_modules(db: Session = Depends(get_db)):
-    stmt = select(ModuleDB).order_by(ModuleDB.id_module)
+def list_modules(course_id: Optional[int] = None, db: Session = Depends(get_db)):
+    stmt = select(ModuleDB)
+    if course_id is not None:
+        stmt = stmt.where(ModuleDB.course_id == course_id)
+    stmt = stmt.order_by(ModuleDB.id_module)
     #Useful for debugging
     result = db.execute(stmt)
     modules = result.scalars().all()
     return modules
-    #return list(db.execute(stmt).scalars())
 
 @app.get("/api/module/{id_module}", response_model=ModuleRead)
 def get_module(id_module: int, db: Session = Depends(get_db)):
