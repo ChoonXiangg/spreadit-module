@@ -10,16 +10,16 @@ NameStr = Annotated[str, StringConstraints(min_length=1, max_length=100)]
 class ModuleCreate(BaseModel):
     id_module: IDModuleInt
     name: NameStr
-    course_id: Optional[str] = None
+    course_id: int  # Required - modules must belong to a course
 
 class ModuleRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id_module: IDModuleInt
     name: NameStr
-    course_id: Optional[str] = None
+    course_id: int
 
 #Partial update module
 class ModuleUpdate(BaseModel):
     id_module: Optional[IDModuleInt] = None
     name: Optional[NameStr] = None
-    course_id: Optional[str] = None
+    course_id: Optional[int] = None
