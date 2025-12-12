@@ -10,12 +10,95 @@ from app.schemas import (ModuleCreate, ModuleRead, ModuleUpdate)
 import httpx
 import os
 
+import os
+import aio_pika
+import json
+
 POST_SERVICE_URL = os.getenv("POST_SERVICE_URL", "http://localhost:8000")
+RABBIT_URL = os.getenv("RABBIT_URL")
+
+async def publish_event(routing_key: str, data: dict):
+    if not RABBIT_URL:
+        return
+        
+    try:
+        connection = await aio_pika.connect_robust(RABBIT_URL)
+        async with connection:
+            channel = await connection.channel()
+            exchange = await channel.declare_exchange("events_topic", aio_pika.ExchangeType.TOPIC)
+            
+            message = aio_pika.Message(
+                body=json.dumps(data).encode(),
+                content_type="application/json"
+            )
+            await exchange.publish(message, routing_key=routing_key)
+    except Exception as e:
+        print(f"Failed to publish event {routing_key}: {e}")
+
+import asyncio
+
+async def process_course_deleted(data: dict):
+    course_id = data.get("course_id")
+    if not course_id:
+        return
+
+    print(f"Processing course deletion for course_id: {course_id}")
+    db = SessionLocal()
+    try:
+        # Delete modules linked to this course
+        # Note: course_id in database is String, so ensure we query correctly
+        modules = db.query(ModuleDB).filter(ModuleDB.course_id == str(course_id)).all()
+        for module in modules:
+            # Important: Publish event BEFORE deleting so downstream services (Post Service) can clean up
+            await publish_event("module.deleted", {"module_id": module.id_module})
+            db.delete(module)
+        
+        db.commit()
+        print(f"Removed {len(modules)} modules for course {course_id}")
+    except Exception as e:
+        print(f"Error processing course deletion: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+async def consume_events():
+    if not RABBIT_URL:
+        print("RABBIT_URL not set, skipping consumer")
+        return
+
+    while True:
+        try:
+            connection = await aio_pika.connect_robust(RABBIT_URL)
+            async with connection:
+                channel = await connection.channel()
+                
+                await channel.declare_exchange("events_topic", aio_pika.ExchangeType.TOPIC)
+                queue = await channel.declare_queue("module_service_queue", durable=True)
+                
+                # Bind to course.deleted
+                await queue.bind("events_topic", routing_key="course.deleted")
+                
+                print("Module Service Consumer Started")
+                
+                async with queue.iterator() as iterator:
+                    async for message in iterator:
+                        async with message.process():
+                            data = json.loads(message.body)
+                            if message.routing_key == "course.deleted":
+                                await process_course_deleted(data)
+
+        except asyncio.CancelledError:
+            print("Consumer cancelled")
+            break
+        except Exception as e:
+            print(f"Consumer connection lost: {e}, retrying in 5s...")
+            await asyncio.sleep(5)
 
 #Replacing @app.on_event("startup")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    task = asyncio.create_task(consume_events())
     yield
 app = FastAPI(lifespan=lifespan)
 
@@ -46,12 +129,17 @@ def health():
     return {"status": "ok"}
 
 @app.post("/api/module", response_model=ModuleRead, status_code=status.HTTP_201_CREATED)
-def add_module(payload: ModuleCreate, db: Session = Depends(get_db)):
+async def add_module(payload: ModuleCreate, db: Session = Depends(get_db)):
     module = ModuleDB(**payload.model_dump())
     db.add(module)
     try:
         db.commit()
         db.refresh(module)
+        await publish_event("module.created", {
+            "module_id": module.id_module, 
+            "name": module.name,
+            "course_id": module.course_id
+        })
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Module already exists")
@@ -76,16 +164,22 @@ def get_module(id_module: int, db: Session = Depends(get_db)):
 
 #Full replace module
 @app.put("/api/module/{id_module}", response_model=ModuleRead, status_code=200)
-def full_replace_module(id_module: int, payload: ModuleCreate, db: Session = Depends(get_db)):
+async def full_replace_module(id_module: int, payload: ModuleCreate, db: Session = Depends(get_db)):
     stmt = select(ModuleDB).where(ModuleDB.id_module == id_module)
     module = db.execute(stmt).scalar_one_or_none()
     if not module:
         raise HTTPException(status_code=404, detail="Module not found")
     module.id_module = payload.id_module
     module.name = payload.name
+    module.course_id = payload.course_id
     try:
         db.commit()
         db.refresh(module)
+        await publish_event("module.replaced", {
+            "module_id": module.id_module, 
+            "name": module.name,
+            "course_id": module.course_id
+        })
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Module ID already exists")
@@ -93,7 +187,7 @@ def full_replace_module(id_module: int, payload: ModuleCreate, db: Session = Dep
 
 #Partial update module
 @app.patch("/api/module/{id_module}", response_model=ModuleRead)
-def partial_update_module(id_module: int, payload: ModuleUpdate, db: Session = Depends(get_db)):
+async def partial_update_module(id_module: int, payload: ModuleUpdate, db: Session = Depends(get_db)):
     stmt = select(ModuleDB).where(ModuleDB.id_module == id_module)
     module = db.execute(stmt).scalar_one_or_none()
     if not module:
@@ -104,6 +198,7 @@ def partial_update_module(id_module: int, payload: ModuleUpdate, db: Session = D
     try:
         db.commit()
         db.refresh(module)
+        await publish_event("module.updated", {"module_id": module.id_module, "updates": update_payload})
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Module ID already exists")
@@ -111,13 +206,14 @@ def partial_update_module(id_module: int, payload: ModuleUpdate, db: Session = D
 
 # DELETE a module
 @app.delete("/api/module/{id_module}", status_code=204)
-def delete_module(id_module: int, db: Session = Depends(get_db)) -> Response:
+async def delete_module(id_module: int, db: Session = Depends(get_db)) -> Response:
     stmt = select(ModuleDB).where(ModuleDB.id_module == id_module)
     module = db.execute(stmt).scalar_one_or_none()
     if not module:
         raise HTTPException(status_code=404, detail="Module not found")
     db.delete(module)
     db.commit()
+    await publish_event("module.deleted", {"module_id": id_module})
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @app.get("/api/proxy/posts")
