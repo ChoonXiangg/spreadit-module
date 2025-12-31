@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import flag_modified
 from app.database import engine, SessionLocal
 from app.models import Base, ModuleDB
 from app.schemas import (ModuleCreate, ModuleRead, ModuleUpdate)
@@ -227,3 +228,56 @@ def proxy_posts():
     with httpx.Client() as client:
         response = client.get(f"{POST_SERVICE_URL}/api/get-all-posts")
     return response.json()
+
+@app.post("/api/modules/{module_id}/enroll/{user_id}", status_code=status.HTTP_200_OK)
+async def enroll_user(module_id: int, user_id: str, db: Session = Depends(get_db)):
+    # Get module
+    module = db.query(ModuleDB).filter(ModuleDB.id_module == module_id).first()
+
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    # Initialize list if null (though default=list handles this for new rows)
+    if module.enrolled_users is None:
+        module.enrolled_users = []
+
+    # Prevent duplicates
+    if user_id in module.enrolled_users:
+        raise HTTPException(status_code=409, detail="User already enrolled in module")
+
+    # Add user id to module
+    # Important: MutableList needs to detect change, append usually works but reassigning ensures it
+    module.enrolled_users.append(user_id)
+    # Trigger update explicitly for some JSON types
+    # module.enrolled_users = list(module.enrolled_users) 
+    
+    db.commit()
+    db.refresh(module)
+
+    # Publish event
+    await publish_event("module.enrolled", {
+        "module_id": module_id,
+        "user_id": user_id
+    })
+
+    return {"message": f"User {user_id} enrolled in module {module_id}"}
+
+@app.post("/api/modules/{module_id}/unenroll/{user_id}", status_code=status.HTTP_200_OK)
+async def unenroll_user(module_id: int, user_id: str, db: Session = Depends(get_db)):
+    module = db.query(ModuleDB).filter(ModuleDB.id_module == module_id).first()
+    if not module:
+        raise HTTPException(status_code=404, detail="Module not found")
+
+    if user_id in module.enrolled_users:
+        module.enrolled_users.remove(user_id)
+        flag_modified(module, "enrolled_users")
+        db.commit()
+        db.refresh(module)
+
+        await publish_event("module.unenrolled", {
+            "module_id": module_id,
+            "user_id": user_id
+        })
+        return {"message": f"User {user_id} unenrolled from module {module_id}"}
+    
+    return {"message": "User was not enrolled"}
