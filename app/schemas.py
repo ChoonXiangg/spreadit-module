@@ -17,6 +17,7 @@ class ModuleRead(BaseModel):
     id_module: IDModuleInt
     name: NameStr
     course_id: int
+    enrolled_users: list[str] = []
 
 #Partial update module
 class ModuleUpdate(BaseModel):
