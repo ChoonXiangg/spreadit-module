@@ -30,3 +30,8 @@ def client():
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+# Configure anyio to only use asyncio backend
+@pytest.fixture(params=["asyncio"])
+def anyio_backend(request):
+    return request.param
