@@ -40,24 +40,63 @@ import asyncio
 
 async def process_course_deleted(data: dict):
     course_id = data.get("course_id")
-    if not course_id:
+    course_db_id = data.get("course_db_id")
+    
+    # Try to use course_db_id if available, otherwise fallback (or fail safely)
+    target_id = course_db_id if course_db_id else course_id
+    
+    if not target_id:
         return
 
-    print(f"Processing course deletion for course_id: {course_id}")
+    print(f"Processing course deletion for course_id: {course_id} (DB ID: {course_db_id})")
     db = SessionLocal()
     try:
         # Delete modules linked to this course
-        # Note: course_id in database is String, so ensure we query correctly
-        modules = db.query(ModuleDB).filter(ModuleDB.course_id == str(course_id)).all()
+        # modules are linked by integer ID
+        modules = db.query(ModuleDB).filter(ModuleDB.course_id == int(target_id)).all()
         for module in modules:
             # Important: Publish event BEFORE deleting so downstream services (Post Service) can clean up
             await publish_event("module.deleted", {"module_id": module.id_module})
             db.delete(module)
         
         db.commit()
-        print(f"Removed {len(modules)} modules for course {course_id}")
+        print(f"Removed {len(modules)} modules for course {target_id}")
     except Exception as e:
         print(f"Error processing course deletion: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+async def process_course_unenrolled(data: dict):
+    course_db_id = data.get("course_db_id")
+    user_id = data.get("user_id")
+
+    if not course_db_id or not user_id:
+        return
+
+    print(f"Processing cascading unenrollment for Course DB ID: {course_db_id}, User: {user_id}")
+    db = SessionLocal()
+    try:
+        # Find all modules for this course
+        modules = db.query(ModuleDB).filter(ModuleDB.course_id == int(course_db_id)).all()
+        
+        count = 0
+        for module in modules:
+            if module.enrolled_users and user_id in module.enrolled_users:
+                module.enrolled_users.remove(user_id)
+                flag_modified(module, "enrolled_users")
+                count += 1
+                
+                # Publish event so User Service removes it from enrolled_modules list
+                await publish_event("module.unenrolled", {
+                    "module_id": module.id_module,
+                    "user_id": user_id
+                })
+        
+        db.commit()
+        print(f"Unenrolled user {user_id} from {count} modules in course {course_db_id}")
+    except Exception as e:
+        print(f"Error processing course unenrollment: {e}")
         db.rollback()
     finally:
         db.close()
@@ -76,8 +115,9 @@ async def consume_events():
                 await channel.declare_exchange("events_topic", aio_pika.ExchangeType.TOPIC)
                 queue = await channel.declare_queue("module_service_queue", durable=True)
                 
-                # Bind to course.deleted
+                # Bind to course.deleted and course.unenrolled
                 await queue.bind("events_topic", routing_key="course.deleted")
+                await queue.bind("events_topic", routing_key="course.unenrolled")
                 
                 print("Module Service Consumer Started")
                 
@@ -87,6 +127,8 @@ async def consume_events():
                             data = json.loads(message.body)
                             if message.routing_key == "course.deleted":
                                 await process_course_deleted(data)
+                            elif message.routing_key == "course.unenrolled":
+                                await process_course_unenrolled(data)
 
         except asyncio.CancelledError:
             print("Consumer cancelled")
