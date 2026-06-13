@@ -1,6 +1,15 @@
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Integer
+from sqlalchemy import JSON
+from sqlalchemy.ext.mutable import MutableList
 
 class Base(DeclarativeBase):
     pass
 
+# Independent table
+class ModuleDB(Base):
+    __tablename__ = "module"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    id_module: Mapped[int] = mapped_column(unique=True, nullable=False) # required field
+    name: Mapped[str] = mapped_column(nullable=False) # required field
+    course_id: Mapped[int] = mapped_column(nullable=False) # required - modules must belong to a course
+    enrolled_users: Mapped[list[str]] = mapped_column(MutableList.as_mutable(JSON), default=list)
